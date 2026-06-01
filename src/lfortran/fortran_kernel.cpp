@@ -1,4 +1,7 @@
 #include <iostream>
+#include <cstdint>
+#include <cstring>
+#include <vector>
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -18,6 +21,7 @@
 #include <xeus/xkernel.hpp>
 #include <xeus/xkernel_configuration.hpp>
 #include <xeus/xhelper.hpp>
+#include <xeus/xbase64.hpp>
 #ifdef __EMSCRIPTEN__
 #include <emscripten/bind.h>
 #include <xeus/xembind.hpp>
@@ -37,6 +41,127 @@
 #include <libasr/string_utils.h>
 
 namespace nl = nlohmann;
+
+// ── Jupyter display_data bridge ──────────────────────────────────────────────
+// These C-linkage symbols are called from JIT'd Fortran code via bind(C)
+// declarations injected at REPL startup in configure_impl().
+// Native (ORC JIT): resolved from the host process automatically.
+// WASM: defined in the MAIN_MODULE; side modules import via --allow-undefined
+// and RTLD_DEFAULT resolves them at dlopen time.
+
+extern "C" {
+
+void lfortran_display_data(const char* mime_type, const char* data) {
+    if (!mime_type || !data) return;
+    nl::json bundle = nl::json::object();
+    bundle[mime_type] = std::string(data);
+    xeus::get_interpreter().display_data(
+        std::move(bundle), nl::json::object(), nl::json::object());
+}
+
+// Encode a Fortran column-major RGBA pixel array A(4,w,h) as a 24-bit BMP,
+// base64-encode it, and publish as an image/bmp display_data message.
+// In memory: channel varies fastest (stride 1), then column (stride 4),
+// then row (stride 4*w).  Channels: 0=R, 1=G, 2=B, 3=A.
+void lfortran_display_image_rgba(int w, int h, int* data) {
+    // BMP rows are 24-bit BGR, bottom-up, padded to 4-byte alignment.
+    int row_stride = ((w * 3 + 3) / 4) * 4;
+    int img_bytes  = row_stride * h;
+    int file_size  = 54 + img_bytes;
+
+    std::vector<uint8_t> bmp(file_size, 0);
+    uint8_t* p = bmp.data();
+
+    // File header (14 bytes)
+    p[0] = 'B'; p[1] = 'M';
+    p[2] = file_size & 0xFF; p[3] = (file_size >> 8) & 0xFF;
+    p[4] = (file_size >> 16) & 0xFF; p[5] = (file_size >> 24) & 0xFF;
+    p[10] = 54; // pixel data offset
+
+    // BITMAPINFOHEADER (40 bytes starting at byte 14)
+    p[14] = 40;
+    p[18] = w & 0xFF; p[19] = (w >> 8) & 0xFF;
+    p[20] = (w >> 16) & 0xFF; p[21] = (w >> 24) & 0xFF;
+    p[22] = h & 0xFF; p[23] = (h >> 8) & 0xFF;
+    p[24] = (h >> 16) & 0xFF; p[25] = (h >> 24) & 0xFF;
+    p[26] = 1;   // color planes
+    p[28] = 24;  // bits per pixel (24-bit BGR, no alpha)
+
+    // Pixel data: BMP row 0 is the bottom of the image.
+    // Fortran row 0 (j=1) is the top → map BMP row r to Fortran row h-1-r.
+    uint8_t* pixels = p + 54;
+    for (int r = 0; r < h; r++) {
+        int fort_row = h - 1 - r;
+        uint8_t* row_ptr = pixels + r * row_stride;
+        for (int c = 0; c < w; c++) {
+            int idx = 4 * c + 4 * w * fort_row;
+            row_ptr[c * 3 + 0] = static_cast<uint8_t>(data[idx + 2]); // B
+            row_ptr[c * 3 + 1] = static_cast<uint8_t>(data[idx + 1]); // G
+            row_ptr[c * 3 + 2] = static_cast<uint8_t>(data[idx + 0]); // R
+        }
+    }
+
+    std::string raw(reinterpret_cast<char*>(bmp.data()), bmp.size());
+    std::string b64 = xeus::base64encode(raw);
+    lfortran_display_data("image/bmp", b64.c_str());
+}
+
+} // extern "C"
+
+// ── Display bootstrap module ──────────────────────────────────────────────────
+// Evaluated once in configure_impl() before any user cell.  After this runs,
+// all subsequent cells can `use lfortran_display` and call display_html(),
+// display_image(), display_svg(), display_latex(), display_markdown().
+
+static constexpr const char* kDisplaySetupCode = R"fortran(
+module lfortran_display
+  use iso_c_binding, only: c_char, c_int, c_null_char
+  implicit none
+
+  interface
+    subroutine lf_display_data(mime, payload) bind(C, name="lfortran_display_data")
+      import :: c_char
+      character(kind=c_char), intent(in) :: mime(*), payload(*)
+    end subroutine
+
+    subroutine lf_display_image_rgba(w, h, rgba) &
+        bind(C, name="lfortran_display_image_rgba")
+      import :: c_int
+      integer(c_int), value       :: w, h
+      integer(c_int), intent(in)  :: rgba(*)
+    end subroutine
+  end interface
+
+contains
+
+  subroutine display_html(html)
+    character(len=*), intent(in) :: html
+    call lf_display_data("text/html"//c_null_char, trim(html)//c_null_char)
+  end subroutine
+
+  subroutine display_svg(svg)
+    character(len=*), intent(in) :: svg
+    call lf_display_data("image/svg+xml"//c_null_char, trim(svg)//c_null_char)
+  end subroutine
+
+  subroutine display_latex(s)
+    character(len=*), intent(in) :: s
+    call lf_display_data("text/latex"//c_null_char, trim(s)//c_null_char)
+  end subroutine
+
+  subroutine display_markdown(s)
+    character(len=*), intent(in) :: s
+    call lf_display_data("text/markdown"//c_null_char, trim(s)//c_null_char)
+  end subroutine
+
+  subroutine display_image(w, h, rgba)
+    integer(c_int), intent(in) :: w, h
+    integer(c_int), intent(in) :: rgba(4, w, h)
+    call lf_display_image_rgba(w, h, rgba)
+  end subroutine
+
+end module lfortran_display
+)fortran";
 
 namespace LCompilers::LFortran {
 
@@ -85,6 +210,10 @@ namespace LCompilers::LFortran {
     public:
         custom_interpreter() : compiler_options{}, e{compiler_options} {
             e.compiler_options.interactive = true;
+            e.compiler_options.po.runtime_library_dir =
+                LCompilers::LFortran::get_runtime_library_dir();
+            std::cerr << "[xlfortran] runtime_library_dir = "
+                      << e.compiler_options.po.runtime_library_dir << std::endl;
         }
         virtual ~custom_interpreter() = default;
 
@@ -411,7 +540,29 @@ namespace LCompilers::LFortran {
     
     void custom_interpreter::configure_impl()
     {
-        // Perform some operations
+        xeus::register_interpreter(this);
+
+        // Inject the lfortran_display module before the first user cell so that
+        // display_html(), display_image(), display_svg() etc. are available in
+        // every subsequent cell — the same pattern xeus-swift uses for its
+        // kDisplaySetupCode / MimeBundleRepresentable bootstrap.
+        LocationManager lm;
+        {
+            LocationManager::FileLocations fl;
+            fl.in_filename = "input";
+            std::ofstream out("input");
+            out << kDisplaySetupCode;
+            lm.files.push_back(fl);
+        }
+        LCompilers::PassManager lpm;
+        lpm.use_default_passes();
+        diag::Diagnostics diagnostics;
+        CompilerOptions cu;
+        auto res = e.evaluate(kDisplaySetupCode, false, lm, lpm, diagnostics);
+        if (!res.ok) {
+            std::string msg = diagnostics.render(lm, cu);
+            std::cerr << "[xlfortran] Warning: display setup failed: " << msg << "\n";
+        }
     }
 
     nl::json custom_interpreter::complete_request_impl(const std::string& code,

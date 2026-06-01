@@ -4,6 +4,8 @@ set(CMAKE_MODULE_PATH "${CMAKE_SOURCE_DIR}/cmake")
 
 project(lfortran_unif_runtime C Fortran)
 
+include(GNUInstallDirs)
+
 set(LFORTRAN_NESTED_BUILD no
     CACHE BOOL "Whether we are being called from the LFortran build system")
 
